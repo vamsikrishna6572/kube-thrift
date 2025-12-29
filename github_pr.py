@@ -1,0 +1,185 @@
+import os
+import tempfile
+from pathlib import Path
+
+from github import Github
+from ruamel.yaml import YAML
+
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+REPO_NAME = "vamsikrishna6572/kube-thrift-demo-infra"
+BRANCH_PREFIX = "kube-thrift/auto-optimize"
+
+yaml = YAML()
+
+
+def clone_repo_temp():
+    from git import Repo
+
+    tmpdir = tempfile.mkdtemp()
+    url = f"https://{GITHUB_TOKEN}:x-oauth-basic@github.com/{REPO_NAME}.git"
+    Repo.clone_from(url, tmpdir)
+    return tmpdir
+
+
+def update_deployment_yaml(repo_path, namespace, deployment_name, new_cpu, new_mem):
+    """
+    Updates YAML AND returns existing values so we can display
+    meaningful PR content.
+    """
+    file_path = Path(repo_path) / f"envs/dev/{deployment_name}/deployment.yaml"
+
+    if not file_path.exists():
+        raise FileNotFoundError(f"Deployment YAML not found at {file_path}")
+
+    data = yaml.load(file_path)
+
+    replicas = data["spec"].get("replicas", 1)
+
+    old_cpu = "unknown"
+    old_mem = "unknown"
+
+    containers = data["spec"]["template"]["spec"]["containers"]
+    for c in containers:
+        if c["name"] == deployment_name:
+            old_cpu = c["resources"]["requests"].get("cpu", "unknown")
+            old_mem = c["resources"]["requests"].get("memory", "unknown")
+
+            # apply new values
+            c["resources"]["requests"]["cpu"] = f"{new_cpu}m"
+            c["resources"]["requests"]["memory"] = f"{new_mem}Mi"
+            break
+
+    with open(file_path, "w") as f:
+        yaml.dump(data, f)
+
+    return old_cpu, old_mem, replicas
+
+
+def create_pr(namespace, deployment_name, recommended_cpu, recommended_mem, savings):
+    from git import Repo
+
+    g = Github(GITHUB_TOKEN)
+    repo = g.get_repo(REPO_NAME)
+
+    branch_name = f"{BRANCH_PREFIX}-{deployment_name}"
+    main_branch = repo.get_branch("main")
+    main_sha = main_branch.commit.sha
+
+    # -------------------------------
+    # Branch Handling
+    # -------------------------------
+    branches = [b.name for b in repo.get_branches()]
+    branch_exists = branch_name in branches
+
+    if not branch_exists:
+        repo.create_git_ref(ref=f"refs/heads/{branch_name}", sha=main_sha)
+        print(f"Created new branch: {branch_name}")
+    else:
+        print(f"Branch {branch_name} exists — resetting it to latest main")
+        ref = repo.get_git_ref(f"heads/{branch_name}")
+        ref.edit(sha=main_sha, force=True)
+
+    # -------------------------------
+    # Clone repo locally
+    # -------------------------------
+    repo_path = clone_repo_temp()
+    local_repo = Repo(repo_path)
+
+    origin = local_repo.remotes.origin
+    origin.fetch()
+
+    local_repo.git.checkout(branch_name)
+
+    # -------------------------------
+    # Update YAML + fetch previous values
+    # -------------------------------
+    old_cpu, old_mem, replicas = update_deployment_yaml(
+        repo_path, namespace, deployment_name, recommended_cpu, recommended_mem
+    )
+
+    # -------------------------------
+    # Commit + Push
+    # -------------------------------
+    local_repo.git.add(all=True)
+
+    try:
+        local_repo.git.commit(m=f"chore: rightsizing {deployment_name}")
+    except Exception:
+        print("No changes to commit (likely already optimized)")
+        return
+
+    local_repo.git.push("origin", branch_name)
+
+    # -------------------------------
+    # Avoid duplicate PRs
+    # -------------------------------
+    existing_prs = repo.get_pulls(state="open")
+    for pr in existing_prs:
+        if pr.head.ref == branch_name:
+            print("PR already exists. Reusing it.")
+            print(pr.html_url)
+            return
+
+    # -------------------------------
+    # Confidence Logic
+    # -------------------------------
+    confidence = "High"
+    reasoning = "Based on 7-day P95 Prometheus metrics with 1.5x safety buffer"
+
+    # -------------------------------
+    # Create Beautiful PR
+    # -------------------------------
+    title = f"💸 Save ~${savings}/month — Right-Size `{deployment_name}` Resources"
+
+    body = f"""
+## 🧠 Kube-Thrift Rightsizing Recommendation
+
+Kube-Thrift detected that **`{deployment_name}`** is over-provisioned.
+This PR safely right-sizes resource requests based on **7-day P95 usage** from Prometheus.
+
+---
+
+### 📊 Resource Change Summary
+| Resource | Current | Recommended |
+|--------|--------|------------|
+| CPU | `{old_cpu}` | `{recommended_cpu}m` |
+| Memory | `{old_mem}` | `{recommended_mem}Mi` |
+
+Replicas: **{replicas}**  
+**Estimated Monthly Savings:** `${savings}`
+
+---
+
+### 🔐 Safety
+- Uses **P95 usage**, not instantaneous spikes
+- Applies **1.5x safety buffer**
+- Does **NOT** auto-apply in cluster
+- Change happens **only after PR approval**
+
+---
+
+### ⏪ Rollback
+If something breaks:
+1️⃣ Revert this PR  
+2️⃣ ArgoCD / GitOps will restore previous configuration
+
+---
+
+### 📡 Source
+- Metrics: Prometheus
+- Strategy: FinOps rightsizing best-practice
+- Generated by: **Kube-Thrift**
+
+---
+
+If this looks good, please review & merge 🚀
+"""
+
+    pr = repo.create_pull(
+        title=title,
+        body=body,
+        head=branch_name,
+        base="main"
+    )
+
+    print(f"PR created: {pr.html_url}")
